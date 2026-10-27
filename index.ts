@@ -2,12 +2,14 @@ import { Buffer } from "node:buffer";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SettingsList, truncateToWidth, type SettingItem } from "@earendil-works/pi-tui";
 
-import { CONFIG_PATH, loadConfig, saveConfig, type DiffApprovalConfig } from "./src/config.js";
+import { CONFIG_PATH, DEFAULT_KEYBINDINGS, loadConfig, normalizeConfig, saveConfig, type DiffApprovalConfig, type DiffColorMode, type DiffKeybindings } from "./src/config.js";
 import { detectLineEnding, generateDiffString, restoreLineEndings, stripBom } from "./src/diff-utils.js";
 import { computeChangePreview, type ChangePreview, type PreviewToolName } from "./src/preview.js";
 import { reviewChangePreview } from "./src/ui.js";
+import { initI18n, t } from "./src/i18n.js";
 
 const STATUS_KEY = "pi-show-diffs";
 const TOOL_CALL_REVIEWED_TOOLS = new Set<PreviewToolName>(["edit", "hashline_edit", "write"]);
@@ -18,6 +20,7 @@ interface PendingImmediateApply {
 }
 
 export default function showDiffsExtension(pi: ExtensionAPI) {
+	initI18n(pi);
 	let config = loadConfig();
 	const pendingImmediateApplies = new Map<string, PendingImmediateApply>();
 
@@ -29,89 +32,298 @@ export default function showDiffsExtension(pi: ExtensionAPI) {
 		pendingImmediateApplies.clear();
 	}
 
+	function getStatusLines() {
+		return [
+			"pi-show-diffs",
+			`Mode: ${config.autoApprove ? t("mode.auto", "auto-approve") : t("mode.manual", "manual review")}`,
+			`Diff colors: ${config.diffColorMode}`,
+			`Layout: ${config.expandableLayout ? "expandable" : "overlay"}`,
+			`Collapsed height: ${config.collapsedHeight}`,
+			`Expanded height: ${config.expandedHeight}`,
+			`Expanded width: ${config.expandedWidth}`,
+			`Keybindings: ${keybindingSummary()}`,
+			`Config: ${CONFIG_PATH}`,
+		];
+	}
+
 	function updateStatus(ctx: ExtensionContext) {
 		if (!ctx.hasUI) return;
 		ctx.ui.setStatus(
 			STATUS_KEY,
-			config.autoApprove ? ctx.ui.theme.fg("warning", "✍ auto-approve file changes") : undefined,
+			config.autoApprove ? ctx.ui.theme.fg("warning", t("status.auto", "✍ auto-approve file changes")) : undefined,
 		);
 	}
 
-	function setConfig(next: DiffApprovalConfig, ctx?: ExtensionContext, notify = true) {
-		config = next;
+	function setConfig(next: Partial<DiffApprovalConfig>, ctx?: ExtensionContext, notify = true, message?: string) {
+		config = normalizeConfig({ ...config, ...next });
 		saveConfig(config);
 		if (!ctx) return;
 		updateStatus(ctx);
 		if (!notify || !ctx.hasUI) return;
-		ctx.ui.notify(
-			config.autoApprove ? "Auto-approve is ON for file changes." : "Manual diff review is ON.",
-			"info",
+		ctx.ui.notify(message ?? getStatusLines().join("\n"), "info");
+	}
+
+	function setAutoApprove(autoApprove: boolean, ctx: ExtensionContext) {
+		setConfig(
+			{ autoApprove },
+			ctx,
+			true,
+			autoApprove ? t("notify.autoOn", "Auto-approve is ON for file changes.") : t("notify.manualOn", "Manual diff review is ON."),
 		);
+	}
+
+	function setDiffColorMode(diffColorMode: DiffColorMode, ctx: ExtensionContext) {
+		setConfig(
+			{ diffColorMode },
+			ctx,
+			true,
+			diffColorMode === "theme"
+				? "Diff colors now follow your pi theme backgrounds."
+				: "Diff colors now use pi-show-diffs default backgrounds.",
+		);
+	}
+
+	function formatKeys(keys: string[] | false): string {
+		if (keys === false) return "disabled";
+		return keys.join(", ");
+	}
+
+	function keybindingLabel(action: keyof DiffKeybindings): string {
+		const labels: Record<keyof DiffKeybindings, string> = {
+			approve: "Approve",
+			reject: "Reject",
+			steer: "Steer",
+			editInline: "Edit inline",
+			autoApprove: "Auto-approve",
+			scrollUp: "Scroll up",
+			scrollDown: "Scroll down",
+			pageUp: "Page up",
+			pageDown: "Page down",
+			scrollTop: "Scroll to top",
+			scrollBottom: "Scroll to bottom",
+			nextHunk: "Next hunk",
+			prevHunk: "Previous hunk",
+			toggleMode: "Toggle mode",
+			toggleWrap: "Toggle wrap",
+			toggleExpand: "Toggle expand",
+			contextMore: "More context",
+			contextLess: "Less context",
+		};
+		return labels[action];
+	}
+
+	function keybindingActions(): (keyof DiffKeybindings)[] {
+		return Object.keys(DEFAULT_KEYBINDINGS) as (keyof DiffKeybindings)[];
+	}
+
+	function countCustomKeybindings(): number {
+		const kb = config.keybindings;
+		return keybindingActions().filter((key) => {
+			const current = kb[key];
+			const defaultVal = DEFAULT_KEYBINDINGS[key];
+			return JSON.stringify(current) !== JSON.stringify(defaultVal);
+		}).length;
+	}
+
+	function keybindingSummary(): string {
+		const customCount = countCustomKeybindings();
+		return customCount === 0 ? "all defaults" : `${customCount} customized`;
+	}
+
+	async function handleKeybindingsMenu(ctx: ExtensionContext) {
+		const actions = keybindingActions();
+		const options = [
+			...actions.map((action) => `${keybindingLabel(action)}: ${formatKeys(config.keybindings[action])}`),
+			"Reset all to defaults",
+			"Back",
+		];
+
+		const kbChoice = await ctx.ui.select("Configure keybindings", options);
+		if (!kbChoice || kbChoice === "Back") return;
+
+		if (kbChoice === "Reset all to defaults") {
+			setConfig({ keybindings: { ...DEFAULT_KEYBINDINGS } }, ctx);
+			return;
+		}
+
+		const selectedAction = actions.find((action) => kbChoice.startsWith(keybindingLabel(action)));
+		if (!selectedAction) return;
+
+		const current = config.keybindings[selectedAction];
+		const currentStr = current === false ? "false" : current.join(", ");
+		const value = await ctx.ui.editor(
+			`${keybindingLabel(selectedAction)} keys (comma-separated, or "false" to disable)`,
+			currentStr,
+		);
+		if (value === undefined || value === null) return;
+
+		const trimmed = value.trim();
+		if (!trimmed) return;
+
+		const newKeys: string[] | false =
+			trimmed.toLowerCase() === "false"
+				? false
+				: trimmed.split(",").map((key) => key.trim()).filter(Boolean);
+
+		setConfig({ keybindings: { ...config.keybindings, [selectedAction]: newKeys } }, ctx);
+	}
+
+	function valuesWithCurrent(currentValue: string, values: string[]) {
+		return values.includes(currentValue) ? values : [currentValue, ...values];
+	}
+
+	async function showApprovalSettings(ctx: ExtensionContext) {
+		let followUp: "keybindings" | undefined;
+		const items: SettingItem[] = [
+			{
+				id: "autoApprove",
+				label: "Auto-approve",
+				currentValue: config.autoApprove ? "on" : "off",
+				values: ["off", "on"],
+				description: "When on, file changes apply without opening the diff review modal.",
+			},
+			{
+				id: "diffColorMode",
+				label: "Diff colors",
+				currentValue: config.diffColorMode,
+				values: ["default", "theme"],
+				description: "default = pi-show-diffs red/green backgrounds; theme = active pi theme success/error backgrounds.",
+			},
+			{
+				id: "expandableLayout",
+				label: "Expandable layout",
+				currentValue: config.expandableLayout ? "on" : "off",
+				values: ["off", "on"],
+				description: "When on, the diff opens inline and Ctrl+F expands it to an overlay.",
+			},
+			{
+				id: "collapsedHeight",
+				label: "Collapsed height",
+				currentValue: config.collapsedHeight,
+				values: valuesWithCurrent(config.collapsedHeight, ["20%", "30%", "40%", "50%"]),
+				description: "Inline diff height when expandable layout is enabled.",
+			},
+			{
+				id: "expandedHeight",
+				label: "Expanded height",
+				currentValue: config.expandedHeight,
+				values: valuesWithCurrent(config.expandedHeight, ["80%", "90%", "100%"]),
+				description: "Maximum overlay height after pressing Ctrl+F in expandable layout.",
+			},
+			{
+				id: "expandedWidth",
+				label: "Expanded width",
+				currentValue: config.expandedWidth,
+				values: valuesWithCurrent(config.expandedWidth, ["80%", "90%", "96%", "100%"]),
+				description: "Overlay width after pressing Ctrl+F in expandable layout.",
+			},
+			{
+				id: "keybindings",
+				label: "Keybindings",
+				currentValue: keybindingSummary(),
+				values: ["open"],
+				description: "Press Enter to configure custom diff modal keybindings.",
+			},
+		];
+
+		await ctx.ui.custom((tui, theme, _kb, done) => {
+			const settingsList = new SettingsList(
+				items,
+				items.length,
+				{
+					label: (text, selected) => (selected ? theme.fg("accent", text) : theme.fg("text", text)),
+					value: (text, selected) => (selected ? theme.fg("accent", text) : theme.fg("muted", text)),
+					description: (text) => theme.fg("dim", text),
+					cursor: theme.fg("accent", "→ "),
+					hint: (text) => theme.fg("dim", text),
+				},
+				(id, newValue) => {
+					if (id === "autoApprove") {
+						setConfig({ autoApprove: newValue === "on" }, ctx, false);
+					}
+					if (id === "diffColorMode") {
+						setConfig({ diffColorMode: newValue === "theme" ? "theme" : "default" }, ctx, false);
+					}
+					if (id === "expandableLayout") {
+						setConfig({ expandableLayout: newValue === "on" }, ctx, false);
+					}
+					if (id === "collapsedHeight") {
+						setConfig({ collapsedHeight: newValue }, ctx, false);
+					}
+					if (id === "expandedHeight") {
+						setConfig({ expandedHeight: newValue }, ctx, false);
+					}
+					if (id === "expandedWidth") {
+						setConfig({ expandedWidth: newValue }, ctx, false);
+					}
+					if (id === "keybindings") {
+						followUp = "keybindings";
+						done(undefined);
+					}
+				},
+				() => done(undefined),
+			);
+
+			return {
+				render: (width: number) => [
+					truncateToWidth(theme.fg("accent", theme.bold("pi-show-diffs settings")), width, "", false),
+					truncateToWidth(theme.fg("muted", `Config: ${CONFIG_PATH}`), width, theme.fg("muted", "…"), false),
+					"",
+					...settingsList.render(width),
+				],
+				invalidate: () => settingsList.invalidate(),
+				handleInput: (data: string) => {
+					settingsList.handleInput(data);
+					tui.requestRender();
+				},
+			};
+		});
+
+		if (followUp === "keybindings") {
+			await handleKeybindingsMenu(ctx);
+		}
 	}
 
 	async function handleCommand(args: string, ctx: ExtensionContext) {
 		const command = args.trim().toLowerCase();
+		const commandParts = command.split(/\s+/).filter(Boolean);
 
 		if (command === "on" || command === "enable" || command === "auto") {
-			setConfig({ autoApprove: true }, ctx);
+			setAutoApprove(true, ctx);
 			return;
 		}
 
 		if (command === "off" || command === "disable" || command === "manual") {
-			setConfig({ autoApprove: false }, ctx);
+			setAutoApprove(false, ctx);
 			return;
 		}
 
 		if (command === "toggle") {
-			setConfig({ autoApprove: !config.autoApprove }, ctx);
+			setAutoApprove(!config.autoApprove, ctx);
+			return;
+		}
+
+		if (
+			commandParts.length === 2 &&
+			["color", "colors", "diff-colors", "diff-color-mode"].includes(commandParts[0]!) &&
+			(commandParts[1] === "default" || commandParts[1] === "theme")
+		) {
+			setDiffColorMode(commandParts[1], ctx);
+			return;
+		}
+
+		if (["keybinding", "keybindings", "keys"].includes(command)) {
+			await handleKeybindingsMenu(ctx);
 			return;
 		}
 
 		if (command === "status") {
-			ctx.ui.notify(
-				[
-					"pi-show-diffs",
-					`Mode: ${config.autoApprove ? "auto-approve" : "manual review"}`,
-					`Config: ${CONFIG_PATH}`,
-				].join("\n"),
-				"info",
-			);
+			ctx.ui.notify(getStatusLines().join("\n"), "info");
 			return;
 		}
 
-		const choice = await ctx.ui.select(
-			[
-				"pi-show-diffs",
-				`Mode: ${config.autoApprove ? "auto-approve" : "manual review"}`,
-				`Config: ${CONFIG_PATH}`,
-			].join("\n"),
-			[
-				config.autoApprove ? "Turn auto-approve off" : "Turn auto-approve on",
-				"Show status",
-				"Cancel",
-			],
-		);
-
-		if (choice === "Turn auto-approve on") {
-			setConfig({ autoApprove: true }, ctx);
-			return;
-		}
-
-		if (choice === "Turn auto-approve off") {
-			setConfig({ autoApprove: false }, ctx);
-			return;
-		}
-
-		if (choice === "Show status") {
-			ctx.ui.notify(
-				[
-					"pi-show-diffs",
-					`Mode: ${config.autoApprove ? "auto-approve" : "manual review"}`,
-					`Config: ${CONFIG_PATH}`,
-				].join("\n"),
-				"info",
-			);
-		}
+		await showApprovalSettings(ctx);
+		return;
 	}
 
 	function getRejectionReason(preview: ChangePreview, feedback?: string) {
@@ -209,12 +421,12 @@ export default function showDiffsExtension(pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("diff-approval", {
-		description: "Toggle or inspect diff approval mode",
+		description: t("cmd.diffApproval", "Toggle or inspect diff approval mode"),
 		handler: handleCommand,
 	});
 
 	pi.registerCommand("show-diffs", {
-		description: "Alias for /diff-approval",
+		description: t("cmd.showDiffs", "Alias for /diff-approval"),
 		handler: handleCommand,
 	});
 
@@ -236,10 +448,16 @@ export default function showDiffsExtension(pi: ExtensionAPI) {
 
 		const decision = await reviewChangePreview(ctx, preview, {
 			allowAfterEdit: true,
+			diffColorMode: config.diffColorMode,
+			expandableLayout: config.expandableLayout,
+			collapsedHeight: config.collapsedHeight,
+			expandedHeight: config.expandedHeight,
+			expandedWidth: config.expandedWidth,
+			keybindings: config.keybindings,
 		});
 
 		if (decision.action === "approve_and_enable_auto") {
-			setConfig({ autoApprove: true }, ctx);
+			setAutoApprove(true, ctx);
 		}
 
 		if (decision.action === "reject" || decision.action === "steer") {
